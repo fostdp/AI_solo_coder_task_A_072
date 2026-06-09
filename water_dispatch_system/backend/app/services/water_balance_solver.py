@@ -1,7 +1,6 @@
 import uuid
 import math
 from decimal import Decimal
-from datetime import datetime
 
 from sqlalchemy import select, and_, desc
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -11,14 +10,16 @@ from app.models import (
     Gate, GateStatus, PumpStation, PumpStatus, DispatchCommand,
 )
 from app.database import async_session
-from app.services.mqtt_service import mqtt_client
-from app.config import DISPATCH_TOPIC_PREFIX
-
-GRAVITY = 9.81
-WAVE_SPEED_FACTOR = 0.7
-ATTENUATION_PER_KM = 0.003
-MIN_WATER_LEVEL = Decimal("0.1")
-MAX_FLOW_CHANGE_RATE = Decimal("0.15")
+from app.services.redis_service import redis_pubsub
+from app.config import (
+    GRAVITY, WAVE_SPEED_FACTOR, ATTENUATION_PER_KM,
+    MIN_WATER_LEVEL, MAX_FLOW_CHANGE_RATE, MAX_STORAGE_CHANGE_RATIO,
+    MAX_LEVEL_RATIO, LOSS_RATE,
+    DISPATCH_LOW_WATER_DEMAND_FACTOR, DISPATCH_LOW_WATER_THRESHOLD,
+    DISPATCH_RAMP_TIME_MINUTES, DISPATCH_RAMP_MIN_FACTOR,
+    DISPATCH_PUMP_STOP_THRESHOLD, DISPATCH_LEVEL_DEVIATION_LOW,
+    DISPATCH_LEVEL_DEVIATION_HIGH, DISPATCH_LEVEL_OVER_CORRECT_FACTOR,
+)
 
 
 async def calculate_dispatch_plan(
@@ -50,6 +51,21 @@ async def calculate_dispatch_plan(
 
     num_sections = len(sections)
     demand_per_section = downstream_demand / Decimal(num_sections) if num_sections > 0 else Decimal("0")
+
+    _gravity = Decimal(str(GRAVITY))
+    _min_water_level = Decimal(str(MIN_WATER_LEVEL))
+    _max_flow_change_rate = Decimal(str(MAX_FLOW_CHANGE_RATE))
+    _max_storage_change_ratio = Decimal(str(MAX_STORAGE_CHANGE_RATIO))
+    _max_level_ratio = Decimal(str(MAX_LEVEL_RATIO))
+    _loss_rate = Decimal(str(LOSS_RATE))
+    _low_water_demand_factor = Decimal(str(DISPATCH_LOW_WATER_DEMAND_FACTOR))
+    _low_water_threshold = Decimal(str(DISPATCH_LOW_WATER_THRESHOLD))
+    _ramp_time_minutes = Decimal(str(DISPATCH_RAMP_TIME_MINUTES))
+    _ramp_min_factor = Decimal(str(DISPATCH_RAMP_MIN_FACTOR))
+    _pump_stop_threshold = Decimal(str(DISPATCH_PUMP_STOP_THRESHOLD))
+    _level_deviation_low = Decimal(str(DISPATCH_LEVEL_DEVIATION_LOW))
+    _level_deviation_high = Decimal(str(DISPATCH_LEVEL_DEVIATION_HIGH))
+    _level_over_correct_factor = Decimal(str(DISPATCH_LEVEL_OVER_CORRECT_FACTOR))
 
     section_states = []
     for section in sections:
@@ -146,11 +162,11 @@ async def calculate_dispatch_plan(
             upstream = section_states[idx - 1]
             flow_change = upstream["section_inflow"] - upstream["section_outflow"]
             if flow_change != Decimal("0"):
-                delay_factor = Decimal("1.0") / (Decimal("1.0") + Decimal(str(round(propagation_time_min / 5.0, 2))))
+                delay_factor = Decimal("1.0") / (Decimal("1.0") + Decimal(str(round(propagation_time_min / float(_ramp_time_minutes), 2))))
                 delayed_inflow = section_inflow + flow_change * attenuation * delay_factor
 
         flow_change = delayed_inflow - section_outflow
-        max_change = delayed_inflow * MAX_FLOW_CHANGE_RATE if delayed_inflow > Decimal("0") else Decimal("10")
+        max_change = delayed_inflow * _max_flow_change_rate if delayed_inflow > Decimal("0") else Decimal("10")
         flow_change = max(-abs(max_change), min(abs(max_change), flow_change))
 
         if design_water_level and design_water_level > Decimal("0"):
@@ -160,19 +176,19 @@ async def calculate_dispatch_plan(
         current_storage = level_ratio * storage_capacity
 
         ds = flow_change
-        max_ds = current_storage * Decimal("0.3")
+        max_ds = current_storage * _max_storage_change_ratio
         ds = max(-abs(max_ds), min(abs(max_ds), ds))
         new_storage = current_storage + ds
 
         if storage_capacity > Decimal("0"):
             new_level_ratio = new_storage / storage_capacity
-            new_level_ratio = max(Decimal("0"), min(Decimal("1.5"), new_level_ratio))
+            new_level_ratio = max(Decimal("0"), min(_max_level_ratio, new_level_ratio))
         else:
             new_level_ratio = level_ratio
 
         clamped_level = new_level_ratio * design_water_level
-        if clamped_level < MIN_WATER_LEVEL:
-            clamped_level = MIN_WATER_LEVEL
+        if clamped_level < _min_water_level:
+            clamped_level = _min_water_level
             new_storage = (clamped_level / design_water_level) * storage_capacity if design_water_level > Decimal("0") else Decimal("0")
             ds = new_storage - current_storage
 
@@ -184,19 +200,19 @@ async def calculate_dispatch_plan(
         target_level_ratio = Decimal("1.0")
         if design_water_level > Decimal("0"):
             level_deviation = current_water_level / design_water_level
-            if level_deviation < Decimal("0.85"):
+            if level_deviation < _level_deviation_low:
                 target_level_ratio = Decimal("1.0")
-            elif level_deviation > Decimal("1.15"):
+            elif level_deviation > _level_deviation_high:
                 target_level_ratio = Decimal("0.9")
             else:
-                target_level_ratio = Decimal("1.0") - (level_deviation - Decimal("1.0")) * Decimal("0.5")
+                target_level_ratio = Decimal("1.0") - (level_deviation - Decimal("1.0")) * _level_over_correct_factor
 
         required_flow = demand_share * target_level_ratio
-        if clamped_level <= MIN_WATER_LEVEL:
-            required_flow = required_flow * Decimal("0.5")
-        if idx > 0 and propagation_time_min > 5:
-            ramp_factor = Decimal("5.0") / Decimal(str(round(propagation_time_min, 1)))
-            ramp_factor = max(Decimal("0.3"), min(Decimal("1.0"), ramp_factor))
+        if clamped_level <= _low_water_threshold:
+            required_flow = required_flow * _low_water_demand_factor
+        if idx > 0 and propagation_time_min > float(_ramp_time_minutes):
+            ramp_factor = _ramp_time_minutes / Decimal(str(round(propagation_time_min, 1)))
+            ramp_factor = max(_ramp_min_factor, min(Decimal("1.0"), ramp_factor))
             required_flow = section_outflow + (required_flow - section_outflow) * ramp_factor
 
         required_flow = required_flow.quantize(Decimal("0.01"))
@@ -236,7 +252,7 @@ async def calculate_dispatch_plan(
                         "command_type": "start_pumps",
                         "command_value": Decimal(new_running - current_running),
                     })
-            elif needed_flow < current_capacity * Decimal("0.8"):
+            elif needed_flow < current_capacity * _pump_stop_threshold:
                 excess = int((current_capacity - needed_flow) / single_pump_flow)
                 stop_count = min(excess, current_running)
                 if stop_count > 0:
@@ -248,7 +264,7 @@ async def calculate_dispatch_plan(
                         "command_value": Decimal(stop_count),
                     })
 
-    total_loss = total_inflow * Decimal("0.02")
+    total_loss = total_inflow * _loss_rate
     balance_error = total_inflow - total_outflow - total_storage_change - total_loss
     balance_error_percent = (
         float(balance_error) / float(total_inflow) * 100
@@ -267,56 +283,20 @@ async def calculate_dispatch_plan(
         "balance_error_percent": balance_error_percent,
     }
 
-    return {
+    plan = {
         "plan_id": plan_id,
         "canal_id": canal_id,
         "commands": commands,
         "water_balance": water_balance,
     }
 
+    await redis_pubsub.publish("dispatch_command", {
+        "plan_id": plan_id,
+        "commands": commands,
+        "water_balance": water_balance,
+    })
 
-async def execute_dispatch_plan(plan: dict) -> list:
-    plan_id = plan["plan_id"]
-    commands = plan.get("commands", [])
-
-    saved_commands = []
-    async with async_session() as session:
-        for cmd in commands:
-            topic = f"{DISPATCH_TOPIC_PREFIX}/{cmd['target_type']}/{cmd['target_id']}"
-            db_cmd = DispatchCommand(
-                plan_id=plan_id,
-                target_type=cmd["target_type"],
-                target_id=cmd["target_id"],
-                target_name=cmd.get("target_name"),
-                command_type=cmd["command_type"],
-                command_value=cmd["command_value"],
-                mqtt_topic=topic,
-                status="pending",
-            )
-            session.add(db_cmd)
-            await session.flush()
-
-            payload = {
-                "command_id": str(db_cmd.id),
-                "plan_id": plan_id,
-                "target_type": cmd["target_type"],
-                "target_id": cmd["target_id"],
-                "command_type": cmd["command_type"],
-                "command_value": float(cmd["command_value"]),
-            }
-
-            mqtt_client.publish(topic, payload)
-
-            db_cmd.status = "sent"
-            db_cmd.sent_at = datetime.utcnow()
-
-            saved_commands.append(db_cmd)
-
-        await session.commit()
-        for c in saved_commands:
-            await session.refresh(c)
-
-    return saved_commands
+    return plan
 
 
 async def calculate_water_balance(
@@ -327,6 +307,8 @@ async def calculate_water_balance(
     canal = canal_result.scalar_one_or_none()
     if not canal:
         return {}
+
+    _loss_rate = Decimal(str(LOSS_RATE))
 
     total_inflow = Decimal("0")
     pump_stmt = select(PumpStation).where(PumpStation.canal_id == canal_id)
@@ -360,7 +342,7 @@ async def calculate_water_balance(
         if status and status.flow:
             total_outflow += status.flow
 
-    total_loss = total_inflow * Decimal("0.02")
+    total_loss = total_inflow * _loss_rate
     total_storage_change = total_inflow - total_outflow - total_loss
     balance_error = total_inflow - total_outflow - total_storage_change - total_loss
     balance_error_percent = (

@@ -7,9 +7,11 @@ import json
 from pathlib import Path
 
 from app.database import engine
-from app.services.mqtt_service import mqtt_client
-from app.services.alarm_service import check_alarms
-from app.routers import monitoring, dispatch, alarm
+from app.services.redis_service import redis_pubsub
+from app.services.command_dispatcher import command_dispatcher
+from app.services.alarm_monitor import check_alarms, check_and_resolve_alarms, evaluate_sensor_data
+from app.config import ALARM_CHECK_INTERVAL_SECONDS
+from app.routers import dtu_receiver, water_balance_solver, command_dispatcher as cmd_router, alarm_monitor
 
 app = FastAPI(title="跨流域调水工程调度监控系统")
 
@@ -21,9 +23,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(monitoring.router, prefix="/api/monitoring", tags=["monitoring"])
-app.include_router(dispatch.router, prefix="/api/dispatch", tags=["dispatch"])
-app.include_router(alarm.router, prefix="/api/alarm", tags=["alarm"])
+app.include_router(dtu_receiver.router, prefix="/api/dtu", tags=["dtu_receiver"])
+app.include_router(water_balance_solver.router, prefix="/api/water-balance", tags=["water_balance_solver"])
+app.include_router(cmd_router.router, prefix="/api/dispatch", tags=["command_dispatcher"])
+app.include_router(alarm_monitor.router, prefix="/api/alarm", tags=["alarm_monitor"])
 
 static_dir = Path(__file__).resolve().parent.parent.parent / "frontend"
 app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
@@ -33,14 +36,26 @@ connected_websockets: list[WebSocket] = []
 
 @app.on_event("startup")
 async def startup():
-    mqtt_client.start()
+    await redis_pubsub.connect()
+
+    redis_pubsub.register_handler("sensor_data", evaluate_sensor_data)
+    redis_pubsub.register_handler("dispatch_command", command_dispatcher.on_dispatch_command)
+    redis_pubsub.register_handler("alarm_event", _on_alarm_event)
+
+    command_dispatcher.start()
+
     asyncio.create_task(alarm_checker_loop())
 
 
 @app.on_event("shutdown")
 async def shutdown():
-    mqtt_client.stop()
+    command_dispatcher.stop()
+    await redis_pubsub.disconnect()
     await engine.dispose()
+
+
+async def _on_alarm_event(data: dict):
+    await broadcast({"type": "alarm", "data": data})
 
 
 async def alarm_checker_loop():
@@ -49,9 +64,12 @@ async def alarm_checker_loop():
             alarms = await check_alarms()
             if alarms:
                 await broadcast({"type": "alarm", "data": alarms})
+            from app.database import async_session
+            async with async_session() as db:
+                await check_and_resolve_alarms(db)
         except Exception:
             pass
-        await asyncio.sleep(5)
+        await asyncio.sleep(ALARM_CHECK_INTERVAL_SECONDS)
 
 
 async def broadcast(message: dict):

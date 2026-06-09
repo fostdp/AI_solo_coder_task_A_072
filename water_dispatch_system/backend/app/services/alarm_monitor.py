@@ -1,3 +1,4 @@
+import logging
 from datetime import datetime, timedelta
 from decimal import Decimal
 
@@ -6,7 +7,156 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import Sensor, SensorData, Alarm
 from app.database import async_session
-from app.config import ALARM_LEVEL1_DURATION_MINUTES, ALARM_LEVEL2_FLOW_DEVIATION_PERCENT
+from app.services.redis_service import redis_pubsub
+from app.config import (
+    ALARM_LEVEL1_DURATION_MINUTES,
+    ALARM_LEVEL2_FLOW_DEVIATION_PERCENT,
+    ALARM_HISTORY_WINDOW_MINUTES,
+)
+
+logger = logging.getLogger(__name__)
+
+
+def _alarm_to_dict(alarm: Alarm) -> dict:
+    return {
+        "id": alarm.id,
+        "alarm_type": alarm.alarm_type,
+        "level": alarm.level,
+        "source_type": alarm.source_type,
+        "source_id": alarm.source_id,
+        "source_name": alarm.source_name,
+        "message": alarm.message,
+        "value": float(alarm.value) if alarm.value else None,
+        "threshold": float(alarm.threshold) if alarm.threshold else None,
+        "duration_minutes": alarm.duration_minutes,
+        "status": alarm.status,
+        "created_at": alarm.created_at.isoformat() if alarm.created_at else None,
+    }
+
+
+async def evaluate_sensor_data(data: dict):
+    if not data.get("exceeds_danger"):
+        return
+
+    sensor_id = data.get("sensor_id")
+    value = data.get("value")
+    sensor_type = data.get("sensor_type")
+
+    if sensor_id is None or value is None or sensor_type is None:
+        return
+
+    async with async_session() as db:
+        sensor_stmt = select(Sensor).where(Sensor.id == sensor_id)
+        sensor_result = await db.execute(sensor_stmt)
+        sensor = sensor_result.scalar_one_or_none()
+        if not sensor:
+            return
+
+        new_alarm = None
+
+        if sensor_type == "water_level":
+            alarm_type = None
+            threshold = None
+
+            if Decimal(str(value)) > sensor.warning_upper:
+                alarm_type = "level_high"
+                threshold = sensor.warning_upper
+            elif Decimal(str(value)) < sensor.warning_lower:
+                alarm_type = "level_low"
+                threshold = sensor.warning_lower
+
+            if alarm_type:
+                since = datetime.utcnow() - timedelta(minutes=ALARM_HISTORY_WINDOW_MINUTES)
+                history_stmt = (
+                    select(SensorData)
+                    .where(
+                        and_(
+                            SensorData.sensor_id == sensor.id,
+                            SensorData.recorded_at >= since,
+                        )
+                    )
+                    .order_by(desc(SensorData.recorded_at))
+                )
+                history_result = await db.execute(history_stmt)
+                history_rows = history_result.scalars().all()
+
+                all_exceed = True
+                for row in history_rows:
+                    if alarm_type == "level_high" and row.value <= sensor.warning_upper:
+                        all_exceed = False
+                        break
+                    elif alarm_type == "level_low" and row.value >= sensor.warning_lower:
+                        all_exceed = False
+                        break
+
+                if all_exceed and len(history_rows) > 0:
+                    earliest = history_rows[-1]
+                    latest_row = history_rows[0]
+                    duration = (latest_row.recorded_at - earliest.recorded_at).total_seconds() / 60
+                    if duration >= ALARM_LEVEL1_DURATION_MINUTES:
+                        existing_stmt = select(Alarm).where(
+                            and_(
+                                Alarm.source_type == "sensor",
+                                Alarm.source_id == sensor.id,
+                                Alarm.alarm_type == alarm_type,
+                                Alarm.status.in_(["active", "acknowledged"]),
+                            )
+                        )
+                        existing_result = await db.execute(existing_stmt)
+                        if not existing_result.scalar_one_or_none():
+                            duration_int = int(duration)
+                            direction = "超上限" if alarm_type == "level_high" else "低于下限"
+                            alarm = Alarm(
+                                alarm_type=alarm_type,
+                                level=1,
+                                source_type="sensor",
+                                source_id=sensor.id,
+                                source_name=sensor.name,
+                                message=f"传感器 {sensor.name} 水位{direction}，持续 {duration_int} 分钟",
+                                value=Decimal(str(value)),
+                                threshold=threshold,
+                                duration_minutes=duration_int,
+                                status="active",
+                            )
+                            db.add(alarm)
+                            await db.flush()
+                            new_alarm = alarm
+
+        elif sensor_type == "flow":
+            if sensor.design_value and sensor.design_value != 0:
+                deviation = abs(float(value) - float(sensor.design_value)) / float(sensor.design_value) * 100
+                if deviation > ALARM_LEVEL2_FLOW_DEVIATION_PERCENT:
+                    existing_stmt = select(Alarm).where(
+                        and_(
+                            Alarm.source_type == "sensor",
+                            Alarm.source_id == sensor.id,
+                            Alarm.alarm_type == "flow_deviation",
+                            Alarm.status.in_(["active", "acknowledged"]),
+                        )
+                    )
+                    existing_result = await db.execute(existing_stmt)
+                    if not existing_result.scalar_one_or_none():
+                        alarm = Alarm(
+                            alarm_type="flow_deviation",
+                            level=2,
+                            source_type="sensor",
+                            source_id=sensor.id,
+                            source_name=sensor.name,
+                            message=f"传感器 {sensor.name} 流量偏差 {deviation:.1f}%，超过阈值 {ALARM_LEVEL2_FLOW_DEVIATION_PERCENT}%",
+                            value=Decimal(str(value)),
+                            threshold=sensor.design_value,
+                            duration_minutes=None,
+                            status="active",
+                        )
+                        db.add(alarm)
+                        await db.flush()
+                        new_alarm = alarm
+
+        if new_alarm:
+            await db.commit()
+            await redis_pubsub.publish("alarm_event", _alarm_to_dict(new_alarm))
+        else:
+            await db.commit()
 
 
 async def check_alarms() -> list:
@@ -42,7 +192,7 @@ async def check_alarms() -> list:
                     threshold = sensor.warning_lower
 
                 if exceeds:
-                    since = datetime.utcnow() - timedelta(minutes=15)
+                    since = datetime.utcnow() - timedelta(minutes=ALARM_HISTORY_WINDOW_MINUTES)
                     history_stmt = (
                         select(SensorData)
                         .where(
@@ -95,20 +245,7 @@ async def check_alarms() -> list:
                                 )
                                 db.add(alarm)
                                 await db.flush()
-                                new_alarms.append({
-                                    "id": alarm.id,
-                                    "alarm_type": alarm.alarm_type,
-                                    "level": alarm.level,
-                                    "source_type": alarm.source_type,
-                                    "source_id": alarm.source_id,
-                                    "source_name": alarm.source_name,
-                                    "message": alarm.message,
-                                    "value": float(alarm.value) if alarm.value else None,
-                                    "threshold": float(alarm.threshold) if alarm.threshold else None,
-                                    "duration_minutes": alarm.duration_minutes,
-                                    "status": alarm.status,
-                                    "created_at": alarm.created_at.isoformat() if alarm.created_at else None,
-                                })
+                                new_alarms.append(alarm)
 
             elif sensor.sensor_type == "flow":
                 if sensor.design_value and sensor.design_value != 0:
@@ -138,23 +275,14 @@ async def check_alarms() -> list:
                             )
                             db.add(alarm)
                             await db.flush()
-                            new_alarms.append({
-                                "id": alarm.id,
-                                "alarm_type": alarm.alarm_type,
-                                "level": alarm.level,
-                                "source_type": alarm.source_type,
-                                "source_id": alarm.source_id,
-                                "source_name": alarm.source_name,
-                                "message": alarm.message,
-                                "value": float(alarm.value) if alarm.value else None,
-                                "threshold": float(alarm.threshold) if alarm.threshold else None,
-                                "duration_minutes": alarm.duration_minutes,
-                                "status": alarm.status,
-                                "created_at": alarm.created_at.isoformat() if alarm.created_at else None,
-                            })
+                            new_alarms.append(alarm)
 
         await db.commit()
-    return new_alarms
+
+    for alarm in new_alarms:
+        await redis_pubsub.publish("alarm_event", _alarm_to_dict(alarm))
+
+    return [_alarm_to_dict(a) for a in new_alarms]
 
 
 async def resolve_alarm(alarm_id: int, db: AsyncSession):

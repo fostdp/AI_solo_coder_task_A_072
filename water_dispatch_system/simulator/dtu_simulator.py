@@ -64,7 +64,7 @@ def print_batch_summary(batch, response_status):
 
 
 def run_simulator(api_url, interval, api_key):
-    endpoint = f"{api_url.rstrip('/')}/api/monitoring/dtu/data"
+    endpoint = f"{api_url.rstrip('/')}/api/dtu/data"
     print(f"DTU Simulator started")
     print(f"  Endpoint: {endpoint}")
     print(f"  Interval: {interval}s")

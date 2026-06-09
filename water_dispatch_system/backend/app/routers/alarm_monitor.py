@@ -7,9 +7,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_db
 from app.models import Alarm
 from app.schemas import AlarmOut, AlarmAckRequest
-from app.services.alarm_service import resolve_alarm
+from app.services.alarm_monitor import check_alarms, resolve_alarm
 
-router = APIRouter(tags=["alarms"])
+router = APIRouter(tags=["alarm_monitor"])
 
 
 @router.get("/", response_model=list[AlarmOut])

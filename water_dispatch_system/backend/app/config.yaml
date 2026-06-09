@@ -1,0 +1,47 @@
+water_balance:
+  gravity: 9.81
+  wave_speed_factor: 0.7
+  attenuation_per_km: 0.003
+  min_water_level: 0.1
+  max_flow_change_rate: 0.15
+  max_storage_change_ratio: 0.3
+  max_level_ratio: 1.5
+  loss_rate: 0.02
+
+alarm:
+  level1_duration_minutes: 10
+  level2_flow_deviation_percent: 20
+  check_interval_seconds: 5
+  history_window_minutes: 15
+
+dispatch:
+  low_water_demand_factor: 0.5
+  low_water_threshold: 0.1
+  ramp_time_minutes: 5
+  ramp_min_factor: 0.3
+  pump_stop_threshold: 0.8
+  level_deviation_low: 0.85
+  level_deviation_high: 1.15
+  level_over_correct_factor: 0.5
+
+mqtt:
+  broker: localhost
+  port: 1883
+  username: ""
+  password: ""
+  dispatch_topic_prefix: dispatch/command
+  plc_response_topic_prefix: dispatch/response
+  command_queue_max_size: 1000
+  ack_timeout_seconds: 300
+
+redis:
+  url: redis://localhost:6379/0
+  channels:
+    sensor_data: channel:sensor_data
+    alarm_event: channel:alarm_event
+    dispatch_command: channel:dispatch_command
+    dispatch_feedback: channel:dispatch_feedback
+
+dtu:
+  api_key: dtu-secret-key-2024
+  sensor_report_interval_seconds: 300
