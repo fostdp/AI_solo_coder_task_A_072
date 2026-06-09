@@ -8,27 +8,67 @@ services:
       POSTGRES_DB: water_dispatch
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8 --lc-collate=C --lc-ctype=C"
+    command:
+      - postgres
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - effective_cache_size=768MB
+      - -c
+      - work_mem=16MB
+      - -c
+      - maintenance_work_mem=128MB
+      - -c
+      - autovacuum=on
+      - -c
+      - autovacuum_max_workers=4
+      - -c
+      - autovacuum_naptime=30s
+      - -c
+      - autovacuum_vacuum_scale_factor=0.05
+      - -c
+      - autovacuum_analyze_scale_factor=0.02
+      - -c
+      - autovacuum_vacuum_cost_limit=2000
+      - -c
+      - checkpoint_completion_target=0.9
+      - -c
+      - wal_buffers=16MB
+      - -c
+      - default_statistics_target=100
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - effective_io_concurrency=200
     ports:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
-      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - ./database/init.sql:/docker-entrypoint-initdb.d/01-init.sql
+      - ./database/postgis_tuning.sql:/docker-entrypoint-initdb.d/02-postgis_tuning.sql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: ["CMD-SHELL", "pg_isready -U postgres -d water_dispatch"]
       interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
 
   redis:
     image: redis:7-alpine
     container_name: water_dispatch_redis
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru --save 60 1000 --save 300 100
     ports:
       - "6379:6379"
+    volumes:
+      - redisdata:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 5s
       retries: 5
+    restart: unless-stopped
 
   mosquitto:
     image: eclipse-mosquitto:2
@@ -37,6 +77,15 @@ services:
       - "1883:1883"
     volumes:
       - ./mosquitto.conf:/mosquitto/config/mosquitto.conf
+      - mqttdata:/mosquitto/data
+      - mqttlog:/mosquitto/log
+    healthcheck:
+      test: ["CMD-SHELL", "mosquitto_pub -h localhost -t healthcheck -m ok || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
 
   backend:
     build:
@@ -56,9 +105,16 @@ services:
       redis:
         condition: service_healthy
       mosquitto:
-        condition: service_started
+        condition: service_healthy
     volumes:
       - ./frontend:/app/frontend
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/docs')\" || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
 
   dtu-simulator:
     build:
@@ -67,8 +123,12 @@ services:
     container_name: water_dispatch_dtu
     environment:
       API_URL: http://backend:8000
+      DTU_API_KEY: dtu-secret-key-2024
+      DTU_INTERVAL: "300"
+      DTU_SCENARIO: normal
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
     restart: unless-stopped
 
   plc-simulator:
@@ -78,9 +138,14 @@ services:
     container_name: water_dispatch_plc
     environment:
       MQTT_BROKER: mosquitto
+      MQTT_PORT: 1883
     depends_on:
-      - mosquitto
+      mosquitto:
+        condition: service_healthy
     restart: unless-stopped
 
 volumes:
   pgdata:
+  redisdata:
+  mqttdata:
+  mqttlog:

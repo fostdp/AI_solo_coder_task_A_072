@@ -1,5 +1,6 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 import asyncio
@@ -14,6 +15,8 @@ from app.config import ALARM_CHECK_INTERVAL_SECONDS
 from app.routers import dtu_receiver, water_balance_solver, command_dispatcher as cmd_router, alarm_monitor
 
 app = FastAPI(title="跨流域调水工程调度监控系统")
+
+app.add_middleware(GZipMiddleware, minimum_size=500, compresslevel=6)
 
 app.add_middleware(
     CORSMiddleware,

@@ -1,5 +1,9 @@
-FROM python:3.11-slim
+FROM python:3.11-alpine AS builder
+WORKDIR /build
+RUN pip install --no-cache-dir --prefix=/install paho-mqtt
+
+FROM python:3.11-alpine
 WORKDIR /app
-RUN pip install --no-cache-dir paho-mqtt
+COPY --from=builder /install /usr/local
 COPY plc_simulator.py .
 CMD ["python", "plc_simulator.py", "--broker", "mosquitto"]

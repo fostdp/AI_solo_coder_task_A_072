@@ -1,5 +1,9 @@
-FROM python:3.11-slim
+FROM python:3.11-alpine AS builder
+WORKDIR /build
+RUN pip install --no-cache-dir --prefix=/install requests
+
+FROM python:3.11-alpine
 WORKDIR /app
-RUN pip install --no-cache-dir requests
+COPY --from=builder /install /usr/local
 COPY dtu_simulator.py .
-CMD ["python", "dtu_simulator.py", "--api-url", "http://backend:8000"]
+CMD ["python", "dtu_simulator.py", "--api-url", "http://backend:8000", "--scenario", "normal"]
