@@ -5,6 +5,12 @@ let ws = null;
 let currentCanal = 1;
 let selectedDevice = null;
 let profileData = null;
+let profileSensorsCache = null;
+let profileCacheCanal = -1;
+let profileRenderPending = false;
+let trendRenderPending = false;
+let cachedTrendData = null;
+let cachedTrendSensor = null;
 
 function init() {
     initMap();
@@ -148,6 +154,31 @@ async function loadSensors() {
     markers.sensors.forEach(function (m) { map.removeLayer(m); });
     markers.sensors = [];
     const filtered = data.filter(function (s) { return s.canal_id === currentCanal; });
+
+    const profileKmMap = {
+        1: { 0: 0, 120: 120, 300: 300, 450: 450, 620: 620, 780: 780, 960: 960, 1100: 1100, 1432: 1432 },
+        2: { 0: 0, 150: 150, 350: 350, 550: 550, 750: 750, 1156: 1156 },
+        3: { 0: 0, 35: 35, 67: 67 },
+    };
+
+    profileSensorsCache = filtered.map(function (s) {
+        const sectionKm = profileKmMap[currentCanal] || {};
+        let km = 0;
+        const keys = Object.keys(sectionKm).map(Number).sort(function (a, b) { return a - b; });
+        for (let i = 0; i < keys.length; i++) {
+            km = keys[i] + (i + 1) * (keys[i + 1] - keys[i]) / (keys.length + 1);
+            if (km > 0) break;
+        }
+        return {
+            km: km,
+            wl: parseFloat(s.latest_value || s.design_value),
+            sensor_type: s.sensor_type,
+            status_color: s.status_color || "green",
+            name: s.name,
+        };
+    });
+    profileCacheCanal = currentCanal;
+
     filtered.forEach(function (sensor) {
         if (sensor.lng == null || sensor.lat == null) return;
         const color = sensor.status_color || "green";
@@ -428,7 +459,62 @@ async function drawTrendForSensor(sensorId, sensor) {
     drawTrend(data.data, sensor);
 }
 
+function downsampleData(points, maxPoints) {
+    if (!points || points.length <= maxPoints) return points;
+    const step = Math.ceil(points.length / maxPoints);
+    const result = [points[0]];
+    for (let i = step; i < points.length - 1; i += step) {
+        let minIdx = i, maxIdx = i;
+        let minVal = points[i].value, maxVal = points[i].value;
+        const end = Math.min(i + step, points.length - 1);
+        for (let j = i; j < end; j++) {
+            const v = points[j].value;
+            if (v < minVal) { minVal = v; minIdx = j; }
+            if (v > maxVal) { maxVal = v; maxIdx = j; }
+        }
+        if (minIdx < maxIdx) {
+            result.push(points[minIdx]);
+            result.push(points[maxIdx]);
+        } else if (maxIdx < minIdx) {
+            result.push(points[maxIdx]);
+            result.push(points[minIdx]);
+        } else {
+            result.push(points[i]);
+        }
+    }
+    result.push(points[points.length - 1]);
+    return result;
+}
+
+function viewportCull(points, xFn, yFn, margin, W, H) {
+    if (!points || points.length === 0) return points;
+    const xMin = -50, xMax = W + 50;
+    const yMin = -50, yMax = H + 50;
+    const result = [];
+    for (let i = 0; i < points.length; i++) {
+        const px = xFn(i);
+        const py = yFn(points[i].value);
+        if (px >= xMin && px <= xMax && py >= yMin && py <= yMax) {
+            result.push(points[i]);
+        } else if (result.length === 0 || result[result.length - 1] !== points[i]) {
+            if (i > 0) result.push(points[i - 1]);
+            result.push(points[i]);
+            if (i < points.length - 1) result.push(points[i + 1]);
+        }
+    }
+    return result.length > 0 ? result : points;
+}
+
 function drawProfile() {
+    if (profileRenderPending) return;
+    profileRenderPending = true;
+    requestAnimationFrame(function () {
+        profileRenderPending = false;
+        _drawProfileImpl();
+    });
+}
+
+function _drawProfileImpl() {
     const canvas = document.getElementById("profile-canvas");
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
@@ -559,9 +645,57 @@ function drawProfile() {
     ctx.fillRect(margin.left + 60, H - 18, 12, 4);
     ctx.fillStyle = "#8899aa";
     ctx.fillText("水位", margin.left + 76, H - 14);
+
+    if (profileSensorsCache && profileCacheCanal === currentCanal) {
+        _drawProfileSensors(ctx, profileSensorsCache, x, y, margin, W, H, maxKm, plotW);
+    }
+}
+
+function _drawProfileSensors(ctx, sensors, xFn, yFn, margin, W, H, maxKm, plotW) {
+    const visibleSensors = sensors.filter(function (s) {
+        const px = xFn(s.km);
+        return px >= margin.left - 10 && px <= W - margin.right + 10;
+    });
+
+    const lod = Math.max(1, Math.ceil(visibleSensors.length / Math.floor(plotW / 16)));
+    const displayed = [];
+    for (let i = 0; i < visibleSensors.length; i += lod) {
+        displayed.push(visibleSensors[i]);
+        if (lod > 1 && i + 1 < visibleSensors.length) {
+            let worst = visibleSensors[i];
+            for (let j = i + 1; j < Math.min(i + lod, visibleSensors.length); j++) {
+                if (visibleSensors[j].status_color === "red") { worst = visibleSensors[j]; break; }
+                if (visibleSensors[j].status_color === "yellow" && worst.status_color !== "red") { worst = visibleSensors[j]; }
+            }
+            if (displayed[displayed.length - 1] !== worst) displayed.push(worst);
+        }
+    }
+
+    displayed.forEach(function (s) {
+        const px = xFn(s.km);
+        const py = yFn(s.wl);
+        if (px < margin.left || px > W - margin.right) return;
+        ctx.fillStyle = s.status_color === "red" ? "#f44336" : s.status_color === "yellow" ? "#ff9800" : "#4caf50";
+        ctx.beginPath();
+        if (s.sensor_type === "water_level") {
+            ctx.arc(px, py, 3, 0, Math.PI * 2);
+        } else {
+            ctx.rect(px - 2, py - 2, 4, 4);
+        }
+        ctx.fill();
+    });
 }
 
 function drawTrend(data, sensor) {
+    if (trendRenderPending) return;
+    trendRenderPending = true;
+    requestAnimationFrame(function () {
+        trendRenderPending = false;
+        _drawTrendImpl(data, sensor);
+    });
+}
+
+function _drawTrendImpl(data, sensor) {
     const canvas = document.getElementById("trend-canvas");
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
@@ -583,13 +717,23 @@ function drawTrend(data, sensor) {
     const plotW = W - margin.left - margin.right;
     const plotH = H - margin.top - margin.bottom;
 
-    const values = data.map(function (d) { return parseFloat(d.value); });
+    const maxPixels = Math.floor(plotW);
+    const sampled = data.length > maxPixels ? downsampleData(data, maxPixels) : data;
+
+    const values = sampled.map(function (d) { return parseFloat(d.value); });
     const minV = Math.min.apply(null, values) * 0.95;
     const maxV = Math.max.apply(null, values) * 1.05;
     const designVal = sensor ? parseFloat(sensor.design_value) : 0;
 
-    function x(i) { return margin.left + (i / (data.length - 1)) * plotW; }
+    function x(i) { return margin.left + (i / (sampled.length - 1)) * plotW; }
     function y(v) { return margin.top + plotH - ((v - minV) / (maxV - minV)) * plotH; }
+
+    const culled = viewportCull(
+        sampled.map(function (d, i) { return { value: parseFloat(d.value), index: i }; }),
+        function (idx) { return x(idx); },
+        function (v) { return y(v); },
+        margin, W, H
+    );
 
     ctx.strokeStyle = "#1e3a5f";
     ctx.lineWidth = 0.5;
@@ -620,29 +764,30 @@ function drawTrend(data, sensor) {
         ctx.fillText("设计值", W - margin.right + 2, y(designVal) + 3);
     }
 
+    const culledValues = culled.map(function (d) { return d.value; });
     const gradient = ctx.createLinearGradient(0, margin.top, 0, margin.top + plotH);
     gradient.addColorStop(0, "rgba(33, 150, 243, 0.3)");
     gradient.addColorStop(1, "rgba(33, 150, 243, 0.0)");
     ctx.fillStyle = gradient;
     ctx.beginPath();
-    ctx.moveTo(x(0), y(values[0]));
-    values.forEach(function (v, i) { ctx.lineTo(x(i), y(v)); });
-    ctx.lineTo(x(values.length - 1), margin.top + plotH);
-    ctx.lineTo(x(0), margin.top + plotH);
+    ctx.moveTo(x(culled[0].index), y(culledValues[0]));
+    culled.forEach(function (d) { ctx.lineTo(x(d.index), y(d.value)); });
+    ctx.lineTo(x(culled[culled.length - 1].index), margin.top + plotH);
+    ctx.lineTo(x(culled[0].index), margin.top + plotH);
     ctx.closePath();
     ctx.fill();
 
     ctx.strokeStyle = "#2196f3";
     ctx.lineWidth = 2;
     ctx.beginPath();
-    values.forEach(function (v, i) {
-        if (i === 0) ctx.moveTo(x(i), y(v));
-        else ctx.lineTo(x(i), y(v));
+    culled.forEach(function (d, i) {
+        if (i === 0) ctx.moveTo(x(d.index), y(d.value));
+        else ctx.lineTo(x(d.index), y(d.value));
     });
     ctx.stroke();
 
-    if (data.length > 0) {
-        const lastIdx = values.length - 1;
+    if (sampled.length > 0) {
+        const lastIdx = sampled.length - 1;
         ctx.fillStyle = "#2196f3";
         ctx.beginPath();
         ctx.arc(x(lastIdx), y(values[lastIdx]), 4, 0, Math.PI * 2);
@@ -652,8 +797,8 @@ function drawTrend(data, sensor) {
     ctx.fillStyle = "#8899aa";
     ctx.font = "9px sans-serif";
     ctx.textAlign = "center";
-    const step = Math.max(1, Math.floor(data.length / 6));
-    data.forEach(function (d, i) {
+    const step = Math.max(1, Math.floor(sampled.length / 6));
+    sampled.forEach(function (d, i) {
         if (i % step === 0) {
             const t = new Date(d.recorded_at);
             ctx.fillText(t.getHours() + ":" + String(t.getMinutes()).padStart(2, "0"), x(i), H - 8);
@@ -677,11 +822,14 @@ function drawPopupTrend(data, device, label) {
     const plotW = W - margin.left - margin.right;
     const plotH = H - margin.top - margin.bottom;
 
-    const values = data.map(function (d) { return parseFloat(d.value || d.opening || d.total_power || 0); });
+    const maxPixels = Math.floor(plotW);
+    const sampled = data.length > maxPixels ? downsampleData(data, maxPixels) : data;
+
+    const values = sampled.map(function (d) { return parseFloat(d.value || d.opening || d.total_power || 0); });
     const minV = Math.min.apply(null, values) * 0.95;
     const maxV = Math.max.apply(null, values) * 1.05;
 
-    function x(i) { return margin.left + (i / (data.length - 1)) * plotW; }
+    function x(i) { return margin.left + (i / (sampled.length - 1)) * plotW; }
     function y(v) { return margin.top + plotH - ((v - minV) / (maxV - minV)) * plotH; }
 
     ctx.strokeStyle = "#1e3a5f";
@@ -729,8 +877,8 @@ function drawPopupTrend(data, device, label) {
     ctx.fillStyle = "#8899aa";
     ctx.font = "8px sans-serif";
     ctx.textAlign = "center";
-    const step = Math.max(1, Math.floor(data.length / 6));
-    data.forEach(function (d, i) {
+    const step = Math.max(1, Math.floor(sampled.length / 6));
+    sampled.forEach(function (d, i) {
         if (i % step === 0) {
             const t = new Date(d.recorded_at);
             ctx.fillText(t.getHours() + ":" + String(t.getMinutes()).padStart(2, "0"), x(i), H - 5);
