@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>跨流域调水工程调度监控系统</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <link rel="stylesheet" href="/static/css/style.css" />
+</head>
+<body>
+    <header class="header">
+        <div class="header-left">
+            <h1>跨流域调水工程调度监控系统</h1>
+            <span class="header-subtitle">南水北调工程全线调度监控平台</span>
+        </div>
+        <div class="header-center">
+            <div class="kpi-card" id="kpi-balance">
+                <div class="kpi-label">全线水量总平衡</div>
+                <div class="kpi-value" id="kpi-balance-value">--</div>
+                <div class="kpi-unit">万m³/h</div>
+            </div>
+            <div class="kpi-card" id="kpi-level">
+                <div class="kpi-label">各渠段水位状态</div>
+                <div class="kpi-value" id="kpi-level-value">--</div>
+                <div class="kpi-unit">正常/预警/超限</div>
+            </div>
+            <div class="kpi-card" id="kpi-power">
+                <div class="kpi-label">泵站总功率</div>
+                <div class="kpi-value" id="kpi-power-value">--</div>
+                <div class="kpi-unit">MW</div>
+            </div>
+        </div>
+        <div class="header-right">
+            <div class="alarm-indicator" id="alarm-indicator">
+                <span class="alarm-dot"></span>
+                <span id="alarm-count">0</span> 条告警
+            </div>
+            <div class="datetime" id="datetime"></div>
+        </div>
+    </header>
+
+    <main class="main-content">
+        <div class="left-panel">
+            <div class="panel-header">
+                <h2>沿线平面图</h2>
+                <select id="canal-select">
+                    <option value="1">中线总干渠</option>
+                    <option value="2">东线干渠</option>
+                    <option value="3">引江济汉渠</option>
+                </select>
+            </div>
+            <div id="map" class="map-container"></div>
+        </div>
+
+        <div class="right-panel">
+            <div class="profile-section">
+                <div class="panel-header">
+                    <h2>干渠纵剖面图</h2>
+                </div>
+                <div class="canvas-container">
+                    <canvas id="profile-canvas" width="800" height="300"></canvas>
+                </div>
+            </div>
+
+            <div class="trend-section">
+                <div class="panel-header">
+                    <h2>实时数据趋势</h2>
+                    <span id="trend-title">选择设备查看趋势</span>
+                </div>
+                <div class="canvas-container">
+                    <canvas id="trend-canvas" width="800" height="250"></canvas>
+                </div>
+            </div>
+
+            <div class="alarm-section">
+                <div class="panel-header">
+                    <h2>告警列表</h2>
+                    <select id="alarm-filter">
+                        <option value="active">活动告警</option>
+                        <option value="acknowledged">已确认</option>
+                        <option value="resolved">已恢复</option>
+                        <option value="">全部</option>
+                    </select>
+                </div>
+                <div class="alarm-list" id="alarm-list"></div>
+            </div>
+        </div>
+    </main>
+
+    <div class="popup-overlay" id="popup-overlay" style="display:none;">
+        <div class="popup-panel" id="popup-panel">
+            <div class="popup-header">
+                <h3 id="popup-title">设备详情</h3>
+                <button class="popup-close" id="popup-close">&times;</button>
+            </div>
+            <div class="popup-body" id="popup-body">
+            </div>
+        </div>
+    </div>
+
+    <div class="dispatch-panel" id="dispatch-panel" style="display:none;">
+        <div class="panel-header">
+            <h3>调度指令</h3>
+            <button class="popup-close" id="dispatch-close">&times;</button>
+        </div>
+        <div class="dispatch-body">
+            <div class="dispatch-form">
+                <label>干渠: <select id="dispatch-canal"></select></label>
+                <label>下游需水量(m³/s): <input type="number" id="dispatch-demand" value="200" step="10"></label>
+                <button id="dispatch-execute">生成调度方案</button>
+            </div>
+            <div class="dispatch-result" id="dispatch-result"></div>
+        </div>
+    </div>
+
+    <button class="dispatch-fab" id="dispatch-fab" title="调度指令">调度</button>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="/static/js/app.js"></script>
+</body>
+</html>

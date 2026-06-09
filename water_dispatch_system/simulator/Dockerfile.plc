@@ -1,0 +1,5 @@
+FROM python:3.11-slim
+WORKDIR /app
+RUN pip install --no-cache-dir paho-mqtt
+COPY plc_simulator.py .
+CMD ["python", "plc_simulator.py", "--broker", "mosquitto"]

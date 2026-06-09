@@ -1,0 +1,9 @@
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+sqlalchemy==2.0.23
+asyncpg==0.29.0
+geoalchemy2==0.14.2
+pydantic==2.5.2
+paho-mqtt==1.6.1
+psycopg2-binary==2.9.9
+requests==2.31.0
